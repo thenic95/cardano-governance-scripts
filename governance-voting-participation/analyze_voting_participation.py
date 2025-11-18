@@ -52,6 +52,7 @@ GOVERNANCE_ACTION_ENDPOINT_CANDIDATES = (
 )
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 DREP_CACHE_PATH = CACHE_DIR / "drep_records.json"
+DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 RoleKey = str
 
@@ -112,6 +113,7 @@ class ActionParticipation:
     enacted_epoch: Optional[int]
     anchor_hash: Optional[str]
     tallies: Dict[RoleKey, RoleParticipation]
+    withdrawals: "WithdrawalSummary" = field(default_factory=lambda: WithdrawalSummary())
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -126,6 +128,25 @@ class ActionParticipation:
             "enacted_epoch": self.enacted_epoch,
             "anchor_hash": self.anchor_hash,
             "tallies": {role: tally.to_dict() for role, tally in self.tallies.items()},
+            "withdrawals": self.withdrawals.to_dict(),
+        }
+
+
+@dataclass
+class WithdrawalSummary:
+    """Simple aggregate covering governance action withdrawals."""
+
+    total_entries: int = 0
+    unique_addresses: int = 0
+    total_amount_lovelace: int = 0
+    records: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_entries": self.total_entries,
+            "unique_addresses": self.unique_addresses,
+            "total_amount_lovelace": self.total_amount_lovelace,
+            "records": list(self.records),
         }
 
 
@@ -294,6 +315,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Write the per-action metrics to a CSV file at this path.",
     )
     parser.add_argument(
+        "--results-dir",
+        default=str(DEFAULT_RESULTS_DIR),
+        help=(
+            "Directory where timestamped export files will be stored when only a filename is provided "
+            "to --output-json/--output-csv. Default: %(default)s"
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging.",
@@ -356,6 +385,36 @@ def fetch_votes_for_action(client: BlockfrostClient, actions_endpoint: str, acti
     return votes
 
 
+def fetch_withdrawals_for_action(client: BlockfrostClient, actions_endpoint: str, action_identifier: str) -> List[Dict[str, Any]]:
+    path = f"{actions_endpoint.rstrip('/')}/{action_identifier}/withdrawals"
+    try:
+        payload = client.get(path)
+    except BlockfrostAPIError as exc:
+        if is_invalid_path_error(exc):
+            logging.debug(
+                "Withdrawals endpoint derived from %s is not available for action %s: %s",
+                actions_endpoint,
+                action_identifier,
+                exc,
+            )
+            return []
+        raise
+
+    if not isinstance(payload, list):
+        logging.debug("Discarding unexpected withdrawal payload for action %s: %s", action_identifier, payload)
+        return []
+
+    withdrawals: List[Dict[str, Any]] = []
+    for raw in payload:
+        if isinstance(raw, dict):
+            withdrawals.append(raw)
+        else:
+            logging.debug("Skipping malformed withdrawal entry for action %s: %s", action_identifier, raw)
+
+    logging.debug("Fetched %d withdrawals for action %s", len(withdrawals), action_identifier)
+    return withdrawals
+
+
 def fetch_active_dreps(client: BlockfrostClient) -> Set[str]:
     candidates: Set[str] = set()
     for params in ({"status": "active"}, {"status": "registered"}, {}):
@@ -397,6 +456,17 @@ def fetch_committee_members(client: BlockfrostClient) -> Set[str]:
     return set()
 
 
+def fetch_committee_member_count(client: BlockfrostClient) -> Optional[int]:
+    members = fetch_committee_members(client)
+    if members:
+        return len(members)
+    fallback = fetch_committee_minimum_size(client)
+    if fallback is not None:
+        logging.info("Falling back to committee_min_size=%d from protocol parameters.", fallback)
+        return fallback
+    return None
+
+
 def extract_committee_members(payload: Any) -> Set[str]:
     members: Set[str] = set()
     if isinstance(payload, dict):
@@ -417,6 +487,29 @@ def extract_committee_members(payload: Any) -> Set[str]:
         for entry in payload:
             members.update(extract_committee_members(entry))
     return members
+
+
+def fetch_committee_minimum_size(client: BlockfrostClient) -> Optional[int]:
+    params = fetch_protocol_parameters(client)
+    if not params:
+        return None
+    size = parse_optional_int(params.get("committee_min_size"))
+    if size is None:
+        return None
+    return max(size, 0)
+
+
+def fetch_protocol_parameters(client: BlockfrostClient) -> Dict[str, Any]:
+    for path in ("/epochs/latest/parameters", "/epochs/last/parameters"):
+        try:
+            return client.get(path)
+        except BlockfrostAPIError as exc:
+            if is_invalid_path_error(exc):
+                logging.debug("Protocol parameters endpoint %s not available: %s", path, exc)
+                continue
+            logging.debug("Unable to fetch protocol parameters from %s: %s", path, exc)
+            break
+    return {}
 
 
 def normalise_committee_member(member_payload: Dict[str, Any]) -> Optional[str]:
@@ -507,6 +600,33 @@ def summarise_votes(
             )
 
     return tallies
+
+
+def summarise_withdrawals(entries: Sequence[Dict[str, Any]]) -> WithdrawalSummary:
+    unique_addresses: Set[str] = set()
+    records: List[Dict[str, Any]] = []
+    total_amount = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        stake_address = str(entry.get("stake_address") or entry.get("address") or "")
+        amount = parse_int(entry.get("amount"))
+        if stake_address:
+            unique_addresses.add(stake_address)
+        total_amount += amount
+        records.append(
+            {
+                "stake_address": stake_address,
+                "amount_lovelace": amount,
+            }
+        )
+
+    return WithdrawalSummary(
+        total_entries=len(records),
+        unique_addresses=len(unique_addresses),
+        total_amount_lovelace=total_amount,
+        records=records,
+    )
 
 
 _TX_EPOCH_CACHE: Dict[str, Optional[int]] = {}
@@ -728,6 +848,41 @@ class _RoleAccumulator:
         return len(self._unique_voters)
 
 
+class OverallParticipationTracker:
+    """Tracks aggregate voter activity across all governance actions."""
+
+    def __init__(self) -> None:
+        self._unique_voters_by_role: Dict[RoleKey, Set[str]] = {}
+        self._actions_with_votes: Dict[RoleKey, Set[str]] = {}
+        self._vote_counts: Dict[RoleKey, int] = {}
+
+    def record_votes_for_action(self, action_identifier: str, votes: Sequence[Dict[str, Any]]) -> None:
+        roles_participating: Set[RoleKey] = set()
+        for vote in votes:
+            if not isinstance(vote, dict):
+                continue
+            role = normalise_role(vote.get("voter_type") or vote.get("voter_role"))
+            actor = extract_actor_id(vote)
+            roles_participating.add(role)
+            if actor:
+                self._unique_voters_by_role.setdefault(role, set()).add(actor)
+            self._vote_counts[role] = self._vote_counts.get(role, 0) + 1
+
+        for role in roles_participating:
+            self._actions_with_votes.setdefault(role, set()).add(action_identifier)
+
+    def summary(self) -> Dict[RoleKey, Dict[str, int]]:
+        roles = set(self._unique_voters_by_role) | set(self._actions_with_votes) | set(self._vote_counts)
+        summary: Dict[RoleKey, Dict[str, int]] = {}
+        for role in roles:
+            summary[role] = {
+                "unique_voters": len(self._unique_voters_by_role.get(role, set())),
+                "actions_participated": len(self._actions_with_votes.get(role, set())),
+                "vote_events": self._vote_counts.get(role, 0),
+            }
+        return summary
+
+
 def normalise_role(raw_role: Optional[str]) -> RoleKey:
     if not raw_role:
         return "unknown"
@@ -850,6 +1005,7 @@ def build_action_participation(
     enacted_epoch: Optional[int],
     anchor_hash: Optional[str],
     tallies: Dict[RoleKey, RoleParticipation],
+    withdrawals: WithdrawalSummary,
 ) -> ActionParticipation:
     return ActionParticipation(
         identifier=identifier,
@@ -863,6 +1019,7 @@ def build_action_participation(
         enacted_epoch=enacted_epoch,
         anchor_hash=anchor_hash,
         tallies=tallies,
+        withdrawals=withdrawals,
     )
 
 
@@ -1007,6 +1164,45 @@ def print_summary_table(
         print("\t".join(row))
 
 
+def print_overall_activity_summary(summary: Dict[RoleKey, Dict[str, int]], total_actions: int) -> None:
+    if total_actions <= 0 or not summary:
+        print("\nNo aggregate voter activity metrics available.")
+        return
+
+    headers = [
+        "role",
+        "unique_voters",
+        "vote_events",
+        "actions_with_votes",
+        "action_coverage",
+    ]
+    print("\nOverall voter activity across %d actions:" % total_actions)
+    print("\t".join(headers))
+
+    preferred_order = {"drep": 0, "cc": 1, "spo": 2}
+
+    def _sort_key(role: RoleKey) -> Tuple[int, str]:
+        return (preferred_order.get(role, 99), role)
+
+    for role in sorted(summary.keys(), key=_sort_key):
+        stats = summary[role]
+        unique_voters = stats.get("unique_voters", 0)
+        vote_events = stats.get("vote_events", 0)
+        actions_with_votes = stats.get("actions_participated", 0)
+        action_coverage = "--"
+        if total_actions:
+            coverage_ratio = actions_with_votes / total_actions
+            action_coverage = f"{coverage_ratio * 100:.1f}%"
+        row = [
+            role.upper(),
+            str(unique_voters),
+            str(vote_events),
+            str(actions_with_votes),
+            action_coverage,
+        ]
+        print("\t".join(row))
+
+
 def format_count_with_baseline(tally: RoleParticipation) -> str:
     baseline = tally.eligible_voters
     if baseline is None or baseline == 0:
@@ -1035,6 +1231,34 @@ def shorten_identifier(identifier: str, keep_start: int = 6, keep_end: int = 4) 
     if len(identifier) <= keep_start + keep_end + 1:
         return identifier
     return f"{identifier[:keep_start]}...{identifier[-keep_end:]}"
+
+
+def resolve_export_path(
+    requested: Optional[str],
+    *,
+    default_dir: Path,
+    default_extension: str,
+    timestamp: Optional[str] = None,
+) -> Optional[Path]:
+    if not requested:
+        return None
+
+    timestamp_label = timestamp or datetime.utcnow().strftime("%Y%m%d")
+    candidate = Path(requested)
+    parent_str = str(candidate.parent)
+    has_explicit_parent = candidate.is_absolute() or parent_str not in ("", ".")
+
+    suffix = candidate.suffix or default_extension
+    stem = candidate.stem or "results"
+
+    if has_explicit_parent:
+        target = candidate
+    else:
+        filename = f"{timestamp_label}_{stem}{suffix}"
+        target = default_dir / filename
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 def export_json(path: str, actions: Sequence[ActionParticipation]) -> None:
@@ -1067,6 +1291,9 @@ def export_csv(path: str, actions: Sequence[ActionParticipation]) -> None:
         "no_votes",
         "abstain_votes",
         "no_confidence_votes",
+        "withdrawal_entries",
+        "withdrawal_unique_addresses",
+        "withdrawal_total_lovelace",
     ]
     with open(path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1095,6 +1322,9 @@ def export_csv(path: str, actions: Sequence[ActionParticipation]) -> None:
                     "no_votes": tally.votes_by_choice.get("no", 0),
                     "abstain_votes": tally.votes_by_choice.get("abstain", 0),
                     "no_confidence_votes": tally.votes_by_choice.get("no_confidence", 0),
+                    "withdrawal_entries": action.withdrawals.total_entries,
+                    "withdrawal_unique_addresses": action.withdrawals.unique_addresses,
+                    "withdrawal_total_lovelace": action.withdrawals.total_amount_lovelace,
                 }
                 if tally.eligible_voters is not None:
                     row["non_voters"] = max(tally.eligible_voters - tally.voters, 0)
@@ -1141,7 +1371,7 @@ def auto_discover_baselines(
         default_counts["drep"] = len(fetch_active_dreps(client)) or None
 
     if overrides.get("cc") is None:
-        default_counts["cc"] = len(fetch_committee_members(client)) or None
+        default_counts["cc"] = fetch_committee_member_count(client)
     if overrides.get("spo") is None:
         default_counts["spo"] = fetch_total_pool_count(client) or None
 
@@ -1202,6 +1432,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         base_url=args.base_url,
         sleep_seconds=max(0.0, args.sleep_seconds),
     )
+    results_dir = Path(args.results_dir)
 
     try:
         baseline_resolver = auto_discover_baselines(client, skip=args.disable_auto_baselines, overrides=overrides)
@@ -1216,6 +1447,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
         action_results: List[ActionParticipation] = []
+        activity_tracker = OverallParticipationTracker()
         for raw_action in actions_raw:
             identifier = extract_action_identifier(raw_action)
             if not identifier:
@@ -1243,6 +1475,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         actions_endpoint,
                     )
                 raise
+
+            activity_tracker.record_votes_for_action(identifier, votes)
+            withdrawals_raw = fetch_withdrawals_for_action(client, actions_endpoint, identifier)
 
             creation_tx_hash = raw_action.get("tx_hash") or detail.get("tx_hash")
             created_epoch = parse_optional_int(detail.get("created_epoch"))
@@ -1293,6 +1528,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             baseline_counts = baseline_resolver.baseline_counts_for_epoch(reference_epoch)
             tallies = summarise_votes(votes, baseline_counts)
+            withdrawal_summary = summarise_withdrawals(withdrawals_raw)
 
             action_results.append(
                 build_action_participation(
@@ -1307,6 +1543,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     enacted_epoch=enacted_epoch,
                     anchor_hash=anchor_hash,
                     tallies=tallies,
+                    withdrawals=withdrawal_summary,
                 )
             )
 
@@ -1322,11 +1559,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_summary_table(action_results)
         trends = summarise_trends(action_results)
         print_trend_summary(trends)
+        overall_activity = activity_tracker.summary()
+        print_overall_activity_summary(overall_activity, len(action_results))
 
-        if args.output_json:
-            export_json(args.output_json, action_results)
-        if args.output_csv:
-            export_csv(args.output_csv, action_results)
+        timestamp_label = datetime.utcnow().strftime("%Y%m%d")
+        json_output_path = resolve_export_path(
+            args.output_json,
+            default_dir=results_dir,
+            default_extension=".json",
+            timestamp=timestamp_label,
+        )
+        csv_output_path = resolve_export_path(
+            args.output_csv,
+            default_dir=results_dir,
+            default_extension=".csv",
+            timestamp=timestamp_label,
+        )
+
+        if json_output_path:
+            export_json(json_output_path, action_results)
+        if csv_output_path:
+            export_csv(csv_output_path, action_results)
 
         return 0
     finally:
